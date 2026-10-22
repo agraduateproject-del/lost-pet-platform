@@ -21,7 +21,7 @@ with st.form("pet_report_form"):
 
   user_name = st.text_input("聯絡人姓名")
   contact = st.text_input("聯絡電話")
-  species = st.selectbox("寵物種類")
+  species = st.text_input("寵物種類")
   breed = st.text_input("寵物品種")
   location = st.text_input("發生地點")
 
