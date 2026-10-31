@@ -2,6 +2,8 @@ streamlit
 torch
 torchvision
 ultralytics
+transformers
+tokenizers
 opencv-python-headless
 pillow
 numpy
