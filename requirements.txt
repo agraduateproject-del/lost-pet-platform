@@ -10,3 +10,4 @@ numpy
 pandas
 supabase
 rembg
+onnxruntime
