@@ -9,3 +9,4 @@ pillow
 numpy
 pandas
 supabase
+rembg
