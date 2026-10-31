@@ -1,11 +1,11 @@
 streamlit
-torch==2.1.2
-torchvision==0.16.2
+torch
+torchvision
 ultralytics
 transformers
 tokenizers
 opencv-python-headless
 pillow
-numpy<2.0
+numpy
 pandas
 supabase
