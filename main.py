@@ -17,7 +17,6 @@ from transformers import (
     AutoModel, 
     AutoModelForImageClassification
 )
-from rembg import remove
 from supabase import create_client, Client
 
 # -------------------------------------------------------------------------
@@ -241,27 +240,45 @@ def _load_single_effnet(weight_path: str, num_classes: int):
     model.eval()
     return model
 
+# -------------------------------------------------------------------------
+# 1-2. 雲端優化：所有 AI 模型改為按需載入（Lazy Loading）與快取
+# -------------------------------------------------------------------------
 @st.cache_resource
-def load_ai_models():
+def get_rembg_remove():
+    from rembg import remove
+    return remove
+
+@st.cache_resource
+def get_yolo_models():
     yolo_base = YOLO(os.path.join(BASE_DIR, "yolov8n.pt"))
     yolo_best = YOLO(os.path.join(BASE_DIR, "best.pt"))
-    
+    return yolo_base, yolo_best
+
+@st.cache_resource
+def get_dino_model():
     dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-small")
     dino_model = AutoModel.from_pretrained("facebook/dinov2-small")
-    
+    return dino_processor, dino_model
+
+@st.cache_resource
+def get_clip_model():
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    return clip_processor, clip_model
 
+@st.cache_resource
+def get_dog_classifier():
     dog_processor = AutoImageProcessor.from_pretrained(DOG_HF_MODEL_NAME)
     dog_model = AutoModelForImageClassification.from_pretrained(DOG_HF_MODEL_NAME)
     dog_model.eval()
-
     raw_dog_classes = [dog_model.config.id2label[i] for i in range(len(dog_model.config.id2label))]
     dog_classes = [translate_breed(c) for c in raw_dog_classes]
+    return dog_processor, dog_model, dog_classes
 
+@st.cache_resource
+def get_effnet_systems():
     effnet_models = {}
-    effnet_classes = {"dog": dog_classes}
-    
+    effnet_classes = {}
     for sp, cfg in EFFNET_SPECIES_CONFIG.items():
         effnet_classes[sp] = load_classes_from_json(sp, cfg["json_path"], cfg["num_classes"])
         w_path = cfg["weight_path"]
@@ -270,22 +287,7 @@ def load_ai_models():
                 effnet_models[sp] = _load_single_effnet(w_path, cfg["num_classes"])
             except Exception as e:
                 print(f"[Warning] 載入 {w_path} 失敗: {e}")
-    
-    return (
-        yolo_base, yolo_best, 
-        dino_processor, dino_model, 
-        clip_processor, clip_model,
-        dog_processor, dog_model,
-        effnet_models, effnet_classes
-    )
-
-(
-    yolo_base, yolo_best, 
-    dino_processor, dino_model, 
-    clip_processor, clip_model,
-    dog_processor, dog_model,
-    effnet_models, effnet_classes
-) = load_ai_models()
+    return effnet_models, effnet_classes
 
 # -------------------------------------------------------------------------
 # 2. 輔助函式
@@ -306,12 +308,16 @@ def upload_original_image_to_supabase(original_img: Image.Image, original_filena
     return supabase.storage.from_(STORAGE_BUCKET).get_public_url(unique_filename)
 
 def remove_bg_and_letterbox(cropped_img: Image.Image, target_size: int = 224) -> Image.Image:
-    fg_rgba = remove(cropped_img)
+    remove_func = get_rembg_remove()
+    fg_rgba = remove_func(cropped_img)
     neutral_gray_bg = Image.new("RGBA", fg_rgba.size, (128, 128, 128, 255))
     composite_img = Image.alpha_composite(neutral_gray_bg, fg_rgba).convert("RGB")
     return ImageOps.pad(composite_img, (target_size, target_size), color=(128, 128, 128))
 
 def extract_reid_embedding(processed_img: Image.Image):
+    dino_processor, dino_model = get_dino_model()
+    clip_processor, clip_model = get_clip_model()
+
     processed_img = processed_img.convert("RGB")
     with torch.no_grad():
         dino_inputs = dino_processor(images=processed_img, return_tensors="pt")
@@ -355,6 +361,7 @@ def predict_pet_breed(cropped_img: Image.Image, species: str) -> str:
     rgb_crop = cropped_img.convert("RGB")
 
     if norm_sp == "dog":
+        dog_processor, dog_model, _ = get_dog_classifier()
         with torch.no_grad():
             inputs = dog_processor(images=rgb_crop, return_tensors="pt")
             logits = dog_model(**inputs).logits
@@ -362,6 +369,7 @@ def predict_pet_breed(cropped_img: Image.Image, species: str) -> str:
             eng_breed = dog_model.config.id2label.get(pred_idx, f"dog_breed_{pred_idx}")
             return translate_breed(eng_breed)
 
+    effnet_models, effnet_classes = get_effnet_systems()
     if norm_sp in effnet_models:
         model = effnet_models[norm_sp]
         input_tensor = effnet_transform(rgb_crop).unsqueeze(0)
@@ -377,6 +385,7 @@ def predict_pet_breed(cropped_img: Image.Image, species: str) -> str:
 
 def identify_and_crop_pet(image: Image.Image):
     """已調整為 best.pt 優先，若未偵測到才使用 yolov8n.pt"""
+    yolo_base, yolo_best = get_yolo_models()
     cropped_image = image
     w, h = image.size
     detected_species = "cat"
@@ -420,9 +429,16 @@ species_options = ["請選擇物種", "狗", "貓", "倉鼠", "兔子", "鳥", "
 selected_species = st.sidebar.selectbox("物種選擇", options=species_options)
 
 selected_breed = None
-if selected_species not in ["請選擇物種", "其他"]:
+if selected_species not in ["請選擇物種", "other", "其他"]:
     eng_sp = SPECIES_CN_TO_EN.get(selected_species, "")
-    translated_breeds = list(effnet_classes.get(eng_sp, []))
+    _, effnet_classes_map = get_effnet_systems()
+    dog_processor_obj, _, dog_classes_list = get_dog_classifier()
+    
+    if eng_sp == "dog":
+        translated_breeds = list(dog_classes_list)
+    else:
+        translated_breeds = list(effnet_classes_map.get(eng_sp, []))
+        
     if "其他 / 不知道" in translated_breeds:
         translated_breeds.remove("其他 / 不知道")
     translated_breeds.insert(0, "其他 / 不知道")
@@ -449,7 +465,7 @@ if uploaded_file is not None:
                     final_species = SPECIES_EN_TO_CN.get(detected_species_raw, "貓")
                     final_breed = predict_pet_breed(cropped_img, final_species)
                     is_ai_predicted = True
-                elif selected_species == "其他":
+                elif selected_species in ["other", "其他"]:
                     final_species = "其他"
                     final_breed = "其他 / 不知道"
                     is_ai_predicted = False
@@ -592,9 +608,16 @@ with db_col2:
     filter_species = st.selectbox("依物種篩選", options=["全部", "狗", "貓", "倉鼠", "兔子", "鳥", "豬", "烏龜", "其他"], key="db_species")
 with db_col3:
     filter_breed_options = ["全部"]
-    if filter_species != "全部" and filter_species != "其他":
+    if filter_species != "全部" and filter_species not in ["其他", "other"]:
         eng_sp = SPECIES_CN_TO_EN.get(filter_species, "")
-        breeds_list = list(effnet_classes.get(eng_sp, []))
+        _, effnet_classes_map = get_effnet_systems()
+        _, _, dog_classes_list = get_dog_classifier()
+        
+        if eng_sp == "dog":
+            breeds_list = list(dog_classes_list)
+        else:
+            breeds_list = list(effnet_classes_map.get(eng_sp, []))
+            
         if "其他 / 不知道" in breeds_list:
             breeds_list.remove("其他 / 不知道")
         breeds_list.insert(0, "其他 / 不知道")
